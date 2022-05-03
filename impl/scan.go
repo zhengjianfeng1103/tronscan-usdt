@@ -1,11 +1,17 @@
 package impl
 
 import (
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"github.com/asdine/storm"
+	"github.com/btcsuite/btcutil/base58"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	ethCommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/fbsobreira/gotron-sdk/pkg/address"
 	"github.com/fbsobreira/gotron-sdk/pkg/client"
@@ -415,6 +421,48 @@ func (ts *TronScanner) RegisterContractListen(address string, symbol string) err
 
 	ts.ContractMap[address] = symbol
 	return nil
+}
+
+func (ts *TronScanner) GenerateBase58AddressOffline() (address map[string]string, err error) {
+
+	privateKey, err := crypto.GenerateKey()
+	if err != nil {
+		return nil, err
+	}
+	privateKeyBytes := crypto.FromECDSA(privateKey)
+	fmt.Println("privateKey:", hexutil.Encode(privateKeyBytes)[2:])
+
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, errors.New("public not ecdsa algorithm")
+	}
+	publicKeyBytes := crypto.FromECDSAPub(publicKeyECDSA)
+	fmt.Println("publicKey:", hexutil.Encode(publicKeyBytes)[2:])
+
+	hexAddress := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
+	hexAddress = "41" + hexAddress[2:]
+
+	fmt.Println("address hex: ", hexAddress)
+	addb, _ := hex.DecodeString(hexAddress)
+	hash1 := s256(s256(addb))
+	secret := hash1[:4]
+	for _, v := range secret {
+		addb = append(addb, v)
+	}
+
+	address = map[string]string{
+		"Address":    base58.Encode(addb),
+		"PrivateKey": hexutil.Encode(privateKeyBytes)[2:],
+	}
+	return address, nil
+}
+
+func s256(s []byte) []byte {
+	h := sha256.New()
+	h.Write(s)
+	bs := h.Sum(nil)
+	return bs
 }
 
 var AddressType, _ = abi.NewType("address", "", nil)

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"github.com/asdine/storm"
 	"github.com/btcsuite/btcutil/base58"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -378,6 +377,15 @@ func (ts *TronScanner) SetCurrentBlock(block *api.BlockExtention) error {
 	return ts.DB.Set(blockChainBucket, currentBlockKey, &block)
 }
 
+func (ts *TronScanner) GetCurrentBlock() (*api.BlockExtention, error) {
+	var block *api.BlockExtention
+	err := ts.DB.Get(blockChainBucket, currentBlockKey, &block)
+	if err != nil {
+		return nil, err
+	}
+	return block, nil
+}
+
 func (ts *TronScanner) DeleteTxHash(txHash string) error {
 	var result Trc20Result
 	err := ts.DB.One("TxHash", txHash, &result)
@@ -430,7 +438,6 @@ func (ts *TronScanner) GenerateBase58AddressOffline() (address map[string]string
 		return nil, err
 	}
 	privateKeyBytes := crypto.FromECDSA(privateKey)
-	fmt.Println("privateKey:", hexutil.Encode(privateKeyBytes)[2:])
 
 	publicKey := privateKey.Public()
 	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
@@ -438,12 +445,12 @@ func (ts *TronScanner) GenerateBase58AddressOffline() (address map[string]string
 		return nil, errors.New("public not ecdsa algorithm")
 	}
 	publicKeyBytes := crypto.FromECDSAPub(publicKeyECDSA)
-	fmt.Println("publicKey:", hexutil.Encode(publicKeyBytes)[2:])
+	zap.S().Debug("publicKey: ", hexutil.Encode(publicKeyBytes)[2:])
 
 	hexAddress := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
 	hexAddress = "41" + hexAddress[2:]
 
-	fmt.Println("address hex: ", hexAddress)
+	zap.S().Debug("address hex: ", hexAddress)
 	addb, _ := hex.DecodeString(hexAddress)
 	hash1 := s256(s256(addb))
 	secret := hash1[:4]

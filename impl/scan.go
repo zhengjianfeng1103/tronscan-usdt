@@ -12,12 +12,12 @@ import (
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/core"
 	"github.com/gogo/protobuf/proto"
+	"github.com/zhengjianfeng1103/tronscan-usdt/timer"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"math/big"
 	"sync"
 	"time"
-	"tronscan-usdt/timer"
 )
 
 const (

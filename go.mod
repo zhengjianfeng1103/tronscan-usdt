@@ -4,9 +4,11 @@ go 1.18
 
 require (
 	github.com/asdine/storm v2.1.2+incompatible
+	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce
 	github.com/ethereum/go-ethereum v1.10.11
 	github.com/fbsobreira/gotron-sdk v0.0.0-20211102183839-58a64f4da5f4
 	github.com/gogo/protobuf v1.3.1
+	github.com/panjf2000/ants/v2 v2.4.8
 	go.uber.org/zap v1.15.0
 	google.golang.org/grpc v1.37.0
 )

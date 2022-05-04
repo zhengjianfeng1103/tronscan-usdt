@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"github.com/asdine/storm"
 	"github.com/btcsuite/btcutil/base58"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -17,6 +18,7 @@ import (
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/core"
 	"github.com/gogo/protobuf/proto"
+	"github.com/panjf2000/ants/v2"
 	"github.com/zhengjianfeng1103/tronscan-usdt/timer"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -46,9 +48,11 @@ type TronScanner struct {
 	IsScanning           bool
 	IsClose              bool
 	Producer             chan interface{}
+	Consumer             chan interface{}
 	scanTask             *timer.TaskTimer //扫描定时器
 	scanTimeInterval     time.Duration
 	RescanLastBlockCount uint64 //重扫上N个区块数量
+	AntPools             *ants.Pool
 }
 
 func NewTronScanner() *TronScanner {
@@ -62,7 +66,12 @@ func NewTronScanner() *TronScanner {
 		panic("start grpc err: " + err.Error())
 	}
 
-	producer := make(chan interface{}, 100)
+	p, err := ants.NewPool(1000)
+	if err != nil {
+		panic("init pools err: " + err.Error())
+	}
+
+	producer := make(chan interface{}, 1000)
 
 	db, err := storm.Open(blockFile)
 	if err != nil {
@@ -81,7 +90,7 @@ func NewTronScanner() *TronScanner {
 		IsScanning:           false,
 		scanTimeInterval:     scanTimeInterval,
 		RescanLastBlockCount: 0, //重扫上N个区块数量
-
+		AntPools:             p,
 	}
 }
 
@@ -95,8 +104,6 @@ func (ts *TronScanner) Start() {
 	ts.IsScanning = true
 	ts.scanTask = timerTask
 	timerTask.Start()
-
-	go ts.ReceiveNotify()
 }
 
 func (ts *TronScanner) Stop() {
@@ -106,6 +113,7 @@ func (ts *TronScanner) Stop() {
 	}
 	ts.IsScanning = false
 	ts.scanTask.Stop()
+	close(ts.Producer)
 }
 
 func (ts *TronScanner) UnRegister(observer ObserverNotify) {
@@ -138,43 +146,36 @@ func (ts *TronScanner) RegisterObservers(observer ObserverNotify) {
 	ts.Observers[observer] = true
 }
 
-func (ts *TronScanner) ReceiveNotify() {
-	for {
-		select {
-		case result := <-ts.Producer:
+func (ts *TronScanner) ReceiveNotify(tr Trc20Result) {
 
-			tr, ok := result.(Trc20Result)
+	var trSample Trc20ResultSimple
+	err := ts.DB.One("TxHash", tr.TxHash, &trSample)
+	switch err {
+	case nil:
+		zap.L().Info("trc20ResultSample hash already notify", zap.Any("txHash", trSample.TxHash))
+
+	case storm.ErrNotFound:
+
+		trSample = Trc20ResultSimple{TxHash: tr.TxHash}
+		err = ts.DB.Save(&trSample)
+
+		if err != nil {
+			zap.L().Error("save trc20  result", zap.Error(err))
+			return
+		}
+
+		for observer, ok := range ts.Observers {
 			if !ok {
 				return
 			}
 
-			var trc20Result Trc20Result
-			err := ts.DB.One("TxHash", tr.TxHash, &trc20Result)
-			switch err {
-			case nil:
-				zap.L().Info("trc20Result hash already notify", zap.Any("txHash", tr.TxHash))
-
-			case storm.ErrNotFound:
-				err = ts.DB.Save(&tr)
-				if err != nil {
-					zap.L().Error("save trc20  result", zap.Error(err))
-					return
-				}
-
-				for observer, ok := range ts.Observers {
-					if !ok {
-						return
-					}
-
-					err := observer.Notify(tr)
-					if err != nil {
-						zap.L().Error("notify result to observers", zap.Error(err))
-					}
-				}
-			default:
-				zap.L().Error("storm get one trc20 result", zap.Error(err))
+			err := observer.Notify(tr)
+			if err != nil {
+				zap.L().Error("notify result to observers", zap.Error(err))
 			}
 		}
+	default:
+		zap.L().Error("storm get one trc20 result", zap.Error(err))
 	}
 }
 
@@ -268,6 +269,7 @@ func (ts *TronScanner) Task() {
 		}
 		currentHash = hash
 
+		zap.L().Info("producer status: ", zap.Any("pool", ts.AntPools.Running()))
 		zap.L().Debug("slowBlock", zap.Any("slowBlockHeight", slowBlock.GetBlockHeader().GetRawData().GetNumber()))
 	}
 
@@ -288,19 +290,79 @@ func (ts *TronScanner) Task() {
 func (ts *TronScanner) batchExtractTransaction(block *api.BlockExtention) error {
 
 	txs := block.Transactions
+	if len(txs) <= 0 {
+		return nil
+	}
 
-	for _, tx := range txs {
-		err := ts.extractContract(tx)
-		if err != nil {
-			return err
+	zap.L().Debug("batchExtractTransaction", zap.Any("height", block.GetBlockHeader().GetRawData().GetNumber()), zap.Any("txs length", len(txs)))
+	//生产者 提取
+	//消费者 消费提取数据
+	//结合起来 通知notify
+
+	failedNum := 0
+	var shouldDone = len(txs)
+	var done = 0
+	quit := make(chan struct{})
+	producer := make(chan Trc20Result)
+	defer func() {
+		close(producer)
+	}()
+
+	consumer := make(chan Trc20Result)
+	defer close(consumer)
+
+	// 3000 笔交易 预计5秒完成
+	extractWork := func(mProducer chan Trc20Result) {
+		for _, tx := range txs {
+			tsCopy := tx
+			if !ts.AntPools.IsClosed() {
+				err := ts.AntPools.Submit(func() {
+
+					err := ts.extractContract(tsCopy, mProducer)
+					if err != nil {
+						zap.L().Error("extract contract ", zap.Error(err))
+						return
+					}
+				})
+				if err != nil {
+					zap.L().Error("submit extract tx func", zap.Error(err))
+					failedNum++
+				}
+			}
 		}
 	}
 
-	return nil
+	saveWork := func(mConsumer chan Trc20Result) {
+		for result := range mConsumer {
+
+			if result.Success {
+				go ts.ReceiveNotify(result)
+			}
+
+			done++
+			zap.L().Debug("saveWork", zap.Any("shouldDone", shouldDone), zap.Any("done", done))
+			if shouldDone == done {
+				close(quit)
+			}
+		}
+
+	}
+
+	go extractWork(producer)
+	go saveWork(consumer)
+	ts.producerToConsumer(producer, consumer, quit)
+
+	if failedNum > 0 {
+		return fmt.Errorf("block scanner extractWork failed")
+	} else {
+		return nil
+	}
+
 }
 
-func (ts *TronScanner) extractContract(tx *api.TransactionExtention) error {
+func (ts *TronScanner) extractContract(tx *api.TransactionExtention, producer chan Trc20Result) error {
 
+	var response Trc20Result
 	txHash := common.Bytes2Hex(tx.Txid)
 	contracts := tx.GetTransaction().GetRawData().GetContract()
 	if len(contracts) > 1 && len(contracts) <= 0 {
@@ -339,7 +401,6 @@ func (ts *TronScanner) extractContract(tx *api.TransactionExtention) error {
 			methodSignature := common.Bytes2Hex(msg.Data[:4])
 			sig := crypto.Keccak256Hash([]byte(Trc20TransferMethod.Sig)).Hex()[2:10]
 
-			zap.L().Debug("method ", zap.Any("methodSignature", methodSignature), zap.Any("sig", sig))
 			if methodSignature != sig {
 				zap.L().Debug("methodSignature not transfer(address,uint256s)")
 				continue
@@ -350,12 +411,11 @@ func (ts *TronScanner) extractContract(tx *api.TransactionExtention) error {
 				zap.S().Error("unpack input", zap.Error(err))
 				continue
 			}
-
 			to := address.HexToAddress("41" + unpack[0].(ethCommon.Address).Hex()[2:]).String()
 			amount := unpack[1].(*big.Int)
 			zap.L().Debug("unpack trc20 transfer method", zap.Any("_to", to), zap.Any("_value", amount), zap.Any("hash", txHash))
 
-			ts.Producer <- Trc20Result{
+			response = Trc20Result{
 				TxHash:          txHash,
 				BlockHash:       common.Bytes2Hex(tx.GetTransaction().GetRawData().RefBlockHash),
 				BlockHeight:     tx.GetTransaction().GetRawData().RefBlockNum,
@@ -364,11 +424,14 @@ func (ts *TronScanner) extractContract(tx *api.TransactionExtention) error {
 				From:            from,
 				To:              to,
 				Symbol:          symbol,
+				Success:         true,
 			}
 		default:
 			zap.L().Debug("not supper contract type", zap.Any("type", contractInfo.Type.Enum().String()), zap.Any("hash", txHash))
 		}
 	}
+
+	producer <- response
 
 	return nil
 }
@@ -465,6 +528,30 @@ func (ts *TronScanner) GenerateBase58AddressOffline() (address map[string]string
 	return address, nil
 }
 
+func (ts *TronScanner) producerToConsumer(producer chan Trc20Result, consumer chan Trc20Result, quit chan struct{}) {
+
+	var values = make([]Trc20Result, 0)
+
+	for {
+		var activeWorker chan<- Trc20Result
+		var activeValue Trc20Result
+		if len(values) > 0 {
+			//获取顶部1个数据
+			activeWorker = consumer
+			activeValue = values[0]
+		}
+
+		select {
+		case data := <-producer:
+			values = append(values, data)
+		case activeWorker <- activeValue:
+			values = values[1:]
+		case <-quit:
+			return
+		}
+	}
+}
+
 func s256(s []byte) []byte {
 	h := sha256.New()
 	h.Write(s)
@@ -489,6 +576,10 @@ var Trc20TransferMethod = abi.NewMethod("transfer", "transfer", abi.Function, ""
 	Type: Bool,
 }})
 
+type Trc20ResultSimple struct {
+	TxHash string `json:"txHash" storm:"id"`
+}
+
 type Trc20Result struct {
 	TxHash          string   `json:"txHash" storm:"id"`
 	BlockHash       string   `json:"blockHash"`
@@ -498,6 +589,7 @@ type Trc20Result struct {
 	From            string   `json:"from"`            //owner address base56
 	To              string   `json:"to"`              //_to address base56
 	Symbol          string   `json:"symbol"`          //
+	Success         bool
 }
 
 type ObserverNotify interface {

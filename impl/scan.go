@@ -30,6 +30,7 @@ import (
 
 const (
 	blockFile        = "block.db"
+	txFile           = "tx.db"
 	blockChainBucket = "blockChainBucket"
 	currentBlockKey  = "currentBlockKey"
 	scanTimeInterval = 5 * time.Second
@@ -44,7 +45,8 @@ type TronScanner struct {
 	ContractMap          map[string]string
 	RW                   sync.RWMutex
 	FullNode             *client.GrpcClient
-	DB                   *storm.DB
+	BlockDB              *storm.DB
+	TxDB                 *storm.DB
 	Observers            map[ObserverNotify]bool
 	IsScanning           bool
 	IsClose              bool
@@ -70,7 +72,12 @@ func NewTronScanner() *TronScanner {
 		panic("init pools err: " + err.Error())
 	}
 
-	db, err := storm.Open(blockFile)
+	blockDB, err := storm.Open(blockFile)
+	if err != nil {
+		panic("open storm file err: " + err.Error())
+	}
+
+	txDB, err := storm.Open(txFile)
 	if err != nil {
 		panic("open storm file err: " + err.Error())
 	}
@@ -82,7 +89,8 @@ func NewTronScanner() *TronScanner {
 		RW:                   sync.RWMutex{},
 		FullNode:             grpcClient,
 		Observers:            obs,
-		DB:                   db,
+		BlockDB:              blockDB,
+		TxDB:                 txDB,
 		IsScanning:           false,
 		scanTimeInterval:     scanTimeInterval,
 		RescanLastBlockCount: 0, //重扫上N个区块数量
@@ -144,7 +152,7 @@ func (ts *TronScanner) RegisterObservers(observer ObserverNotify) {
 func (ts *TronScanner) ReceiveNotify(tr Trc20Result) {
 
 	var trSample Trc20ResultSimple
-	err := ts.DB.One("TxHash", tr.TxHash, &trSample)
+	err := ts.TxDB.One("TxHash", tr.TxHash, &trSample)
 	switch err {
 	case nil:
 		zap.L().Info("trc20ResultSample hash already notify", zap.Any("txHash", trSample.TxHash))
@@ -152,7 +160,7 @@ func (ts *TronScanner) ReceiveNotify(tr Trc20Result) {
 	case storm.ErrNotFound:
 
 		trSample = Trc20ResultSimple{TxHash: tr.TxHash}
-		err = ts.DB.Save(&trSample)
+		err = ts.TxDB.Save(&trSample)
 
 		if err != nil {
 			zap.L().Error("save trc20  result", zap.Error(err))
@@ -179,20 +187,20 @@ func (ts *TronScanner) Task() {
 
 	var (
 		currentHeight int64
-		currentHash   string
 	)
 
-	var currentBlock *api.BlockExtention
-	err := ts.DB.Get(blockChainBucket, currentBlockKey, &currentBlock)
+	var currentBlock *SimpleBlock
+	err := ts.BlockDB.Get(blockChainBucket, currentBlockKey, &currentBlock)
 	switch err {
 	case nil:
-		currentHeight = currentBlock.GetBlockHeader().GetRawData().GetNumber()
-		currentHash = common.Bytes2Hex(currentBlock.GetBlockid())
+		currentHeight = currentBlock.Height
 	case storm.ErrNotFound:
-		currentBlock, err = ts.FullNode.GetNowBlock()
-		currentHeight = currentBlock.GetBlockHeader().GetRawData().GetNumber()
-		currentHash = common.Bytes2Hex(currentBlock.GetBlockid())
-
+		hBlock, err := ts.FullNode.GetNowBlock()
+		if err != nil {
+			zap.L().Error("get now block", zap.Error(err))
+			return
+		}
+		currentHeight = hBlock.GetBlockHeader().GetRawData().GetNumber()
 	default:
 		zap.L().Error("read block from local db", zap.Error(err))
 		return
@@ -239,16 +247,16 @@ func (ts *TronScanner) Task() {
 				//不考虑分叉
 				err = ts.AntPools.Submit(func() {
 					safeH := safeCurrentHeight.Inc()
-					zap.L().Info("in block batch pool", zap.Any("safeCurrentHeight", safeH))
 					var slowBlock *api.BlockExtention
 					slowBlock, err = ts.FullNode.GetBlockByNum(safeH)
 
+					zap.L().Info("in block batch pool", zap.Any("safeCurrentHeight", safeH))
 					batchWait.Done()
 
 					if err != nil {
 						zap.L().Error("query block by num", zap.Error(err), zap.Any("height", safeH))
 						//丢块 等待重新扫
-						err = ts.DB.Save(&UnScanBlock{
+						err = ts.BlockDB.Save(&UnScanBlock{
 							Height: safeH,
 						})
 					} else {
@@ -256,7 +264,7 @@ func (ts *TronScanner) Task() {
 						if err != nil {
 							zap.L().Error("extract block txs err, may need rescan", zap.Error(err), zap.Any("height", safeH))
 							//扫块里交易数据不全 等待重新扫
-							err = ts.DB.Save(&UnScanBlock{
+							err = ts.BlockDB.Save(&UnScanBlock{
 								Height: safeH,
 							})
 						}
@@ -268,24 +276,22 @@ func (ts *TronScanner) Task() {
 
 			batchWait.Wait()
 
+			zap.L().Debug("L", zap.Any("time", time.Now()))
 			currentHeight = safeCurrentHeight.Load()
 
-			var slowBlockInBatch *api.BlockExtention
-			slowBlockInBatch, err = ts.FullNode.GetBlockByNum(currentHeight)
-			if slowBlockInBatch.GetBlockHeader().GetRawData().GetNumber() == 0 {
-				zap.L().Error("slowBlock height is 0")
-				break
-			}
+			zap.L().Debug("P", zap.Any("time", time.Now()))
 
-			err = ts.DB.Set(blockChainBucket, currentBlockKey, &slowBlockInBatch)
+			saveBlock := SimpleBlock{
+				Height: currentHeight,
+			}
+			err = ts.BlockDB.Set(blockChainBucket, currentBlockKey, &saveBlock)
 			if err != nil {
 				zap.L().Error("save current/unScan block", zap.Error(err))
 			}
 
-			hash := common.Bytes2Hex(slowBlockInBatch.GetBlockid())
-			currentHash = hash
+			zap.L().Debug("H", zap.Any("time", time.Now()))
 
-			zap.L().Info("slowBlock InBatch", zap.Any("EndHeight", slowBlockInBatch.GetBlockHeader().GetRawData().GetNumber()))
+			zap.L().Info("slowBlock InBatch", zap.Any("EndHeight", currentHeight))
 
 		} else {
 
@@ -294,25 +300,17 @@ func (ts *TronScanner) Task() {
 			if err != nil {
 				zap.L().Error("query block by num", zap.Error(err), zap.Any("height", currentHeight))
 				//丢块 等待重新扫
-				err = ts.DB.Save(&UnScanBlock{
+				err = ts.BlockDB.Save(&UnScanBlock{
 					Height: currentHeight,
 				})
 				continue
-			}
-
-			parentHash := common.Bytes2Hex(slowBlock.GetBlockHeader().GetRawData().GetParentHash())
-			hash := common.Bytes2Hex(slowBlock.GetBlockid())
-
-			if currentHash != parentHash {
-				zap.L().Error("可能分叉了 hash info", zap.Any("parentHash", parentHash), zap.Any("currentHash", currentHash), zap.Any("hash", hash))
-				break
 			}
 
 			err = ts.batchExtractTransaction(slowBlock)
 			if err != nil {
 				zap.L().Error("extract block txs err, may need rescan", zap.Error(err), zap.Any("height", currentHeight))
 				//扫块里交易数据不全 等待重新扫
-				err = ts.DB.Save(&UnScanBlock{
+				err = ts.BlockDB.Save(&UnScanBlock{
 					Height: currentHeight,
 				})
 				continue
@@ -323,11 +321,13 @@ func (ts *TronScanner) Task() {
 				break
 			}
 
-			err = ts.DB.Set(blockChainBucket, currentBlockKey, &slowBlock)
+			saveBlock := SimpleBlock{
+				Height: currentHeight,
+			}
+			err = ts.BlockDB.Set(blockChainBucket, currentBlockKey, &saveBlock)
 			if err != nil {
 				zap.L().Error("save current/unScan block", zap.Error(err))
 			}
-			currentHash = hash
 
 			zap.L().Debug("slowBlock", zap.Any("slowBlockHeight", slowBlock.GetBlockHeader().GetRawData().GetNumber()))
 		}
@@ -497,13 +497,13 @@ func (ts *TronScanner) extractContract(tx *api.TransactionExtention, producer ch
 	return nil
 }
 
-func (ts *TronScanner) SetCurrentBlock(block *api.BlockExtention) error {
-	return ts.DB.Set(blockChainBucket, currentBlockKey, &block)
+func (ts *TronScanner) SetCurrentBlock(block *SimpleBlock) error {
+	return ts.BlockDB.Set(blockChainBucket, currentBlockKey, &block)
 }
 
-func (ts *TronScanner) GetCurrentBlock() (*api.BlockExtention, error) {
-	var block *api.BlockExtention
-	err := ts.DB.Get(blockChainBucket, currentBlockKey, &block)
+func (ts *TronScanner) GetCurrentBlock() (*SimpleBlock, error) {
+	var block *SimpleBlock
+	err := ts.BlockDB.Get(blockChainBucket, currentBlockKey, &block)
 	if err != nil {
 		return nil, err
 	}
@@ -512,11 +512,11 @@ func (ts *TronScanner) GetCurrentBlock() (*api.BlockExtention, error) {
 
 func (ts *TronScanner) DeleteTxHash(txHash string) error {
 	var result Trc20Result
-	err := ts.DB.One("TxHash", txHash, &result)
+	err := ts.TxDB.One("TxHash", txHash, &result)
 	switch err {
 	case storm.ErrNotFound:
 	case nil:
-		err = ts.DB.DeleteStruct(&result)
+		err = ts.TxDB.DeleteStruct(&result)
 		if err != nil {
 			return err
 		}
@@ -527,12 +527,12 @@ func (ts *TronScanner) DeleteTxHash(txHash string) error {
 }
 
 func (ts *TronScanner) GetBucketNames() []string {
-	return ts.DB.Bucket()
+	return ts.BlockDB.Bucket()
 }
 
 func (ts *TronScanner) GetTxByHash(txHash string) (*Trc20Result, error) {
 	var result Trc20Result
-	err := ts.DB.One("TxHash", txHash, &result)
+	err := ts.TxDB.One("TxHash", txHash, &result)
 	switch err {
 	case storm.ErrNotFound:
 		return nil, err
@@ -639,6 +639,11 @@ var Trc20TransferMethod = abi.NewMethod("transfer", "transfer", abi.Function, ""
 
 type Trc20ResultSimple struct {
 	TxHash string `json:"txHash" storm:"id"`
+}
+
+type SimpleBlock struct {
+	Height int64 `json:"height" storm:"id"`
+	//Hash   string `json:"hash"`
 }
 
 type Trc20Result struct {

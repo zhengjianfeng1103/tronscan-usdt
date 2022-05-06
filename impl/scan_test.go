@@ -52,7 +52,7 @@ func (f *FlySwap) RemoveWallet(base58Address string) {
 }
 
 func (f *FlySwap) Notify(result Trc20Result) error {
-	zap.L().Info("fly swap receive", zap.Any("result", result))
+	zap.L().Debug("fly swap receive", zap.Any("result", result))
 
 	if _, ok := f.WalletMap[result.To]; ok {
 		//入帐
@@ -86,7 +86,8 @@ func TestTronScanner_Start(t *testing.T) {
 	names := scanner.GetBucketNames()
 	t.Log(names)
 
-	err = scanner.SetCurrentBlock(slowBlock)
+	simpleBlock := SimpleBlock{Height: slowBlock.GetBlockHeader().GetRawData().GetNumber()}
+	err = scanner.SetCurrentBlock(&simpleBlock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,8 @@ func TestTronScanner_Start_MaxHeight(t *testing.T) {
 	names := scanner.GetBucketNames()
 	t.Log(names)
 
-	err = scanner.SetCurrentBlock(slowBlock)
+	simpleBlock := SimpleBlock{Height: slowBlock.GetBlockHeader().GetRawData().GetNumber()}
+	err = scanner.SetCurrentBlock(&simpleBlock)
 	if err != nil {
 		t.Fatal(err)
 	}

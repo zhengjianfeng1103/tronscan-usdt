@@ -238,11 +238,13 @@ func (ts *TronScanner) Task() {
 
 				//不考虑分叉
 				err = ts.AntPools.Submit(func() {
-
 					safeH := safeCurrentHeight.Inc()
 					zap.L().Info("in block batch pool", zap.Any("safeCurrentHeight", safeH))
 					var slowBlock *api.BlockExtention
 					slowBlock, err = ts.FullNode.GetBlockByNum(safeH)
+
+					batchWait.Done()
+
 					if err != nil {
 						zap.L().Error("query block by num", zap.Error(err), zap.Any("height", safeH))
 						//丢块 等待重新扫
@@ -259,11 +261,9 @@ func (ts *TronScanner) Task() {
 							})
 						}
 					}
-
-					time.Sleep(1 * time.Second)
-					batchWait.Done()
 				})
 
+				time.Sleep(1 * time.Second)
 			}
 
 			batchWait.Wait()

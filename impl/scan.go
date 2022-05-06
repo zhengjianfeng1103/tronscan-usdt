@@ -260,6 +260,7 @@ func (ts *TronScanner) Task() {
 						}
 					}
 
+					time.Sleep(1 * time.Second)
 					batchWait.Done()
 				})
 

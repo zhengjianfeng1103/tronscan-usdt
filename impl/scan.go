@@ -20,6 +20,7 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/panjf2000/ants/v2"
 	"github.com/zhengjianfeng1103/tronscan-usdt/timer"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"math/big"
@@ -47,8 +48,6 @@ type TronScanner struct {
 	Observers            map[ObserverNotify]bool
 	IsScanning           bool
 	IsClose              bool
-	Producer             chan interface{}
-	Consumer             chan interface{}
 	scanTask             *timer.TaskTimer //扫描定时器
 	scanTimeInterval     time.Duration
 	RescanLastBlockCount uint64 //重扫上N个区块数量
@@ -66,12 +65,10 @@ func NewTronScanner() *TronScanner {
 		panic("start grpc err: " + err.Error())
 	}
 
-	p, err := ants.NewPool(1000)
+	p, err := ants.NewPool(10000)
 	if err != nil {
 		panic("init pools err: " + err.Error())
 	}
-
-	producer := make(chan interface{}, 1000)
 
 	db, err := storm.Open(blockFile)
 	if err != nil {
@@ -84,7 +81,6 @@ func NewTronScanner() *TronScanner {
 		ContractMap:          contractMap,
 		RW:                   sync.RWMutex{},
 		FullNode:             grpcClient,
-		Producer:             producer,
 		Observers:            obs,
 		DB:                   db,
 		IsScanning:           false,
@@ -113,7 +109,6 @@ func (ts *TronScanner) Stop() {
 	}
 	ts.IsScanning = false
 	ts.scanTask.Stop()
-	close(ts.Producer)
 }
 
 func (ts *TronScanner) UnRegister(observer ObserverNotify) {
@@ -222,55 +217,121 @@ func (ts *TronScanner) Task() {
 		maxHeight := maxHeightBlock.GetBlockHeader().GetRawData().GetNumber()
 
 		currentHeight++
+
 		if currentHeight >= maxHeight {
 			zap.L().Info("currentHeight >= maxHeight not handle currentHeight++ ", zap.Any("currentHeight++", currentHeight), zap.Any("maxHeight", maxHeight))
 			break
 		}
 
-		zap.L().Info("init read block", zap.Any("currentHeight", currentHeight), zap.Any("maxHeight", maxHeight))
+		diffBlockNum := maxHeight - currentHeight
+		zap.L().Info("init read block", zap.Any("currentHeight", currentHeight), zap.Any("maxHeight", maxHeight), zap.Any("diffBlockNum", diffBlockNum))
 
-		var slowBlock *api.BlockExtention
-		slowBlock, err = ts.FullNode.GetBlockByNum(currentHeight)
-		if err != nil {
-			zap.L().Error("query block by num", zap.Error(err), zap.Any("height", currentHeight))
-			//丢块 等待重新扫
-			err = ts.DB.Save(&UnScanBlock{
-				Height: currentHeight,
-			})
-			continue
+		//并发追高
+		if diffBlockNum > 2 {
+			zap.L().Info("slowBlock InBatch", zap.Any("StartHeight", currentHeight))
+
+			var batchWait sync.WaitGroup
+			var safeCurrentHeight = atomic.NewInt64(currentHeight)
+
+			for i := currentHeight; i < currentHeight+diffBlockNum; i++ {
+				batchWait.Add(1)
+
+				//不考虑分叉
+				err = ts.AntPools.Submit(func() {
+
+					safeH := safeCurrentHeight.Inc()
+					zap.L().Info("in block batch pool", zap.Any("safeCurrentHeight", safeH))
+					var slowBlock *api.BlockExtention
+					slowBlock, err = ts.FullNode.GetBlockByNum(safeH)
+					if err != nil {
+						zap.L().Error("query block by num", zap.Error(err), zap.Any("height", safeH))
+						//丢块 等待重新扫
+						err = ts.DB.Save(&UnScanBlock{
+							Height: safeH,
+						})
+					} else {
+						err = ts.batchExtractTransaction(slowBlock)
+						if err != nil {
+							zap.L().Error("extract block txs err, may need rescan", zap.Error(err), zap.Any("height", safeH))
+							//扫块里交易数据不全 等待重新扫
+							err = ts.DB.Save(&UnScanBlock{
+								Height: safeH,
+							})
+						}
+					}
+
+					batchWait.Done()
+				})
+
+			}
+
+			batchWait.Wait()
+
+			currentHeight = safeCurrentHeight.Load()
+
+			var slowBlockInBatch *api.BlockExtention
+			slowBlockInBatch, err = ts.FullNode.GetBlockByNum(currentHeight)
+			if slowBlockInBatch.GetBlockHeader().GetRawData().GetNumber() == 0 {
+				zap.L().Error("slowBlock height is 0")
+				break
+			}
+
+			err = ts.DB.Set(blockChainBucket, currentBlockKey, &slowBlockInBatch)
+			if err != nil {
+				zap.L().Error("save current/unScan block", zap.Error(err))
+			}
+
+			hash := common.Bytes2Hex(slowBlockInBatch.GetBlockid())
+			currentHash = hash
+
+			zap.L().Info("slowBlock InBatch", zap.Any("EndHeight", slowBlockInBatch.GetBlockHeader().GetRawData().GetNumber()))
+
+		} else {
+
+			var slowBlock *api.BlockExtention
+			slowBlock, err = ts.FullNode.GetBlockByNum(currentHeight)
+			if err != nil {
+				zap.L().Error("query block by num", zap.Error(err), zap.Any("height", currentHeight))
+				//丢块 等待重新扫
+				err = ts.DB.Save(&UnScanBlock{
+					Height: currentHeight,
+				})
+				continue
+			}
+
+			parentHash := common.Bytes2Hex(slowBlock.GetBlockHeader().GetRawData().GetParentHash())
+			hash := common.Bytes2Hex(slowBlock.GetBlockid())
+
+			if currentHash != parentHash {
+				zap.L().Error("可能分叉了 hash info", zap.Any("parentHash", parentHash), zap.Any("currentHash", currentHash), zap.Any("hash", hash))
+				break
+			}
+
+			err = ts.batchExtractTransaction(slowBlock)
+			if err != nil {
+				zap.L().Error("extract block txs err, may need rescan", zap.Error(err), zap.Any("height", currentHeight))
+				//扫块里交易数据不全 等待重新扫
+				err = ts.DB.Save(&UnScanBlock{
+					Height: currentHeight,
+				})
+				continue
+			}
+
+			if slowBlock.GetBlockHeader().GetRawData().GetNumber() == 0 {
+				zap.L().Error("slowBlock height is 0")
+				break
+			}
+
+			err = ts.DB.Set(blockChainBucket, currentBlockKey, &slowBlock)
+			if err != nil {
+				zap.L().Error("save current/unScan block", zap.Error(err))
+			}
+			currentHash = hash
+
+			zap.L().Debug("slowBlock", zap.Any("slowBlockHeight", slowBlock.GetBlockHeader().GetRawData().GetNumber()))
 		}
-
-		parentHash := common.Bytes2Hex(slowBlock.GetBlockHeader().GetRawData().GetParentHash())
-		hash := common.Bytes2Hex(slowBlock.GetBlockid())
-
-		if currentHash != parentHash {
-			zap.L().Error("可能分叉了 hash info", zap.Any("parentHash", parentHash), zap.Any("currentHash", currentHash), zap.Any("hash", hash))
-			break
-		}
-
-		err = ts.batchExtractTransaction(slowBlock)
-		if err != nil {
-			zap.L().Error("extract block txs err, may need rescan", zap.Error(err), zap.Any("height", currentHeight))
-			//扫块里交易数据不全 等待重新扫
-			err = ts.DB.Save(&UnScanBlock{
-				Height: currentHeight,
-			})
-			continue
-		}
-
-		if slowBlock.GetBlockHeader().GetRawData().GetNumber() == 0 {
-			zap.L().Error("slowBlock height is 0")
-			break
-		}
-
-		err = ts.DB.Set(blockChainBucket, currentBlockKey, &slowBlock)
-		if err != nil {
-			zap.L().Error("save current/unScan block", zap.Error(err))
-		}
-		currentHash = hash
 
 		zap.L().Info("producer status: ", zap.Any("pool", ts.AntPools.Running()))
-		zap.L().Debug("slowBlock", zap.Any("slowBlockHeight", slowBlock.GetBlockHeader().GetRawData().GetNumber()))
 	}
 
 	//执行重新扫块
@@ -340,7 +401,6 @@ func (ts *TronScanner) batchExtractTransaction(block *api.BlockExtention) error 
 			}
 
 			done++
-			zap.L().Debug("saveWork", zap.Any("shouldDone", shouldDone), zap.Any("done", done))
 			if shouldDone == done {
 				close(quit)
 			}

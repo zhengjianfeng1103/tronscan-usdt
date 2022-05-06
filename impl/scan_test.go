@@ -52,7 +52,7 @@ func (f *FlySwap) RemoveWallet(base58Address string) {
 }
 
 func (f *FlySwap) Notify(result Trc20Result) error {
-	zap.L().Debug("fly swap receive", zap.Any("result", result))
+	zap.L().Info("fly swap receive", zap.Any("result", result))
 
 	if _, ok := f.WalletMap[result.To]; ok {
 		//入帐

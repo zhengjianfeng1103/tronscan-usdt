@@ -53,7 +53,9 @@ type TronScanner struct {
 	scanTask             *timer.TaskTimer //扫描定时器
 	scanTimeInterval     time.Duration
 	RescanLastBlockCount uint64 //重扫上N个区块数量
-	AntPools             *ants.Pool
+	BlockPools           *ants.Pool
+	TxPools              *ants.Pool
+	NotifyPools          *ants.Pool
 }
 
 func NewTronScanner() *TronScanner {
@@ -67,7 +69,17 @@ func NewTronScanner() *TronScanner {
 		panic("start grpc err: " + err.Error())
 	}
 
-	p, err := ants.NewPool(10000)
+	blockPools, err := ants.NewPool(2000)
+	if err != nil {
+		panic("init pools err: " + err.Error())
+	}
+
+	txPools, err := ants.NewPool(2000)
+	if err != nil {
+		panic("init pools err: " + err.Error())
+	}
+
+	notifyPools, err := ants.NewPool(2000)
 	if err != nil {
 		panic("init pools err: " + err.Error())
 	}
@@ -94,7 +106,9 @@ func NewTronScanner() *TronScanner {
 		IsScanning:           false,
 		scanTimeInterval:     scanTimeInterval,
 		RescanLastBlockCount: 0, //重扫上N个区块数量
-		AntPools:             p,
+		BlockPools:           blockPools,
+		TxPools:              txPools,
+		NotifyPools:          notifyPools,
 	}
 }
 
@@ -163,7 +177,7 @@ func (ts *TronScanner) ReceiveNotify(tr Trc20Result) {
 		err = ts.TxDB.Save(&trSample)
 
 		if err != nil {
-			zap.L().Error("save trc20  result", zap.Error(err))
+			zap.L().Error("save trc20 result", zap.Error(err))
 			return
 		}
 
@@ -245,7 +259,7 @@ func (ts *TronScanner) Task() {
 				batchWait.Add(1)
 
 				//不考虑分叉
-				err = ts.AntPools.Submit(func() {
+				err = ts.BlockPools.Submit(func() {
 					safeH := safeCurrentHeight.Inc()
 					var slowBlock *api.BlockExtention
 					slowBlock, err = ts.FullNode.GetBlockByNum(safeH)
@@ -332,7 +346,7 @@ func (ts *TronScanner) Task() {
 			zap.L().Debug("slowBlock", zap.Any("slowBlockHeight", slowBlock.GetBlockHeader().GetRawData().GetNumber()))
 		}
 
-		zap.L().Info("producer status: ", zap.Any("pool", ts.AntPools.Running()))
+		zap.L().Info("producer status: ", zap.Any("blockPool", ts.BlockPools.Running()), zap.Any("txPool", ts.TxPools.Running()), zap.Any("Notify", ts.NotifyPools.Running()))
 	}
 
 	//执行重新扫块
@@ -377,8 +391,8 @@ func (ts *TronScanner) batchExtractTransaction(block *api.BlockExtention) error 
 	extractWork := func(mProducer chan Trc20Result) {
 		for _, tx := range txs {
 			tsCopy := tx
-			if !ts.AntPools.IsClosed() {
-				err := ts.AntPools.Submit(func() {
+			if !ts.TxPools.IsClosed() {
+				err := ts.TxPools.Submit(func() {
 
 					err := ts.extractContract(tsCopy, mProducer)
 					if err != nil {
@@ -397,8 +411,17 @@ func (ts *TronScanner) batchExtractTransaction(block *api.BlockExtention) error 
 	saveWork := func(mConsumer chan Trc20Result) {
 		for result := range mConsumer {
 
-			if result.Success {
-				go ts.ReceiveNotify(result)
+			resultCopy := result
+
+			if resultCopy.Success {
+
+				err := ts.NotifyPools.Submit(func() {
+					ts.ReceiveNotify(resultCopy)
+				})
+
+				if err != nil {
+					zap.L().Error("submit receive notify: ", zap.Error(err))
+				}
 			}
 
 			done++
@@ -406,7 +429,6 @@ func (ts *TronScanner) batchExtractTransaction(block *api.BlockExtention) error 
 				close(quit)
 			}
 		}
-
 	}
 
 	go extractWork(producer)
@@ -455,7 +477,6 @@ func (ts *TronScanner) extractContract(tx *api.TransactionExtention, producer ch
 			var symbol string
 			var ok bool
 			if symbol, ok = ts.ContractMap[contractAddress]; !ok {
-				zap.L().Debug("contractAddress not in contractMap")
 				continue
 			}
 

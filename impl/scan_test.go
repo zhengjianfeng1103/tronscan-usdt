@@ -4,6 +4,8 @@ import (
 	"github.com/fbsobreira/gotron-sdk/pkg/address"
 	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
 	"go.uber.org/zap"
+	"net/http"
+	_ "net/http/pprof"
 	"sync"
 	"testing"
 	"time"
@@ -131,6 +133,10 @@ func TestTronScanner_Start_MaxHeight(t *testing.T) {
 
 	scanner.Start()
 	defer scanner.Stop()
+
+	go func() {
+		http.ListenAndServe("0.0.0.0:8899", nil)
+	}()
 
 	time.Sleep(100000 * time.Second)
 }

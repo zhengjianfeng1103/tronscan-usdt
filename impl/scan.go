@@ -79,7 +79,7 @@ func NewTronScanner() *TronScanner {
 		panic("init pools err: " + err.Error())
 	}
 
-	notifyPools, err := ants.NewPool(2000)
+	notifyPools, err := ants.NewPool(3000)
 	if err != nil {
 		panic("init pools err: " + err.Error())
 	}
@@ -165,35 +165,53 @@ func (ts *TronScanner) RegisterObservers(observer ObserverNotify) {
 
 func (ts *TronScanner) ReceiveNotify(tr Trc20Result) {
 
-	var trSample Trc20ResultSimple
-	err := ts.TxDB.One("TxHash", tr.TxHash, &trSample)
-	switch err {
-	case nil:
-		zap.L().Info("trc20ResultSample hash already notify", zap.Any("txHash", trSample.TxHash))
+	//var trSample Trc20ResultSimple
+	//err := ts.TxDB.One("TxHash", tr.TxHash, &trSample)
+	//
+	//switch err {
+	//case nil:
+	//	zap.L().Info("trc20ResultSample hash already notify", zap.Any("txHash", trSample.TxHash))
+	//
+	//case storm.ErrNotFound:
+	//
+	//	zap.L().Info("Notify L", zap.Any("start", time.Now()))
+	//
+	//	trSample = Trc20ResultSimple{TxHash: tr.TxHash}
+	//	err = ts.TxDB.Save(&trSample)
+	//
+	//	if err != nil {
+	//		zap.L().Error("save trc20 result", zap.Error(err))
+	//		return
+	//	}
+	//
+	//	for observer, ok := range ts.Observers {
+	//		if !ok {
+	//			return
+	//		}
+	//
+	//		err := observer.Notify(tr)
+	//		if err != nil {
+	//			zap.L().Error("notify result to observers", zap.Error(err))
+	//		}
+	//	}
+	//
+	//	zap.L().Info("Notify H", zap.Any("start", time.Now()))
+	//
+	//default:
+	//	zap.L().Error("storm get one trc20 result", zap.Error(err))
+	//}
 
-	case storm.ErrNotFound:
-
-		trSample = Trc20ResultSimple{TxHash: tr.TxHash}
-		err = ts.TxDB.Save(&trSample)
-
-		if err != nil {
-			zap.L().Error("save trc20 result", zap.Error(err))
+	for observer, ok := range ts.Observers {
+		if !ok {
 			return
 		}
 
-		for observer, ok := range ts.Observers {
-			if !ok {
-				return
-			}
-
-			err := observer.Notify(tr)
-			if err != nil {
-				zap.L().Error("notify result to observers", zap.Error(err))
-			}
+		err := observer.Notify(tr)
+		if err != nil {
+			zap.L().Error("notify result to observers", zap.Error(err))
 		}
-	default:
-		zap.L().Error("storm get one trc20 result", zap.Error(err))
 	}
+
 }
 
 func (ts *TronScanner) Task() {

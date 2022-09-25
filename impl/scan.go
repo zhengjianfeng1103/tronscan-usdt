@@ -6,6 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
+	"sync"
+	"time"
+
 	"github.com/asdine/storm"
 	"github.com/btcsuite/btcutil/base58"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -23,9 +27,6 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"math/big"
-	"sync"
-	"time"
 )
 
 const (
@@ -33,7 +34,7 @@ const (
 	txFile           = "tx.db"
 	blockChainBucket = "blockChainBucket"
 	currentBlockKey  = "currentBlockKey"
-	scanTimeInterval = 5 * time.Second
+	scanTimeInterval = 10 * time.Second
 )
 
 type UnScanBlock struct {
@@ -258,7 +259,7 @@ func (ts *TronScanner) Task() {
 
 		currentHeight++
 
-		if currentHeight >= maxHeight {
+		if currentHeight > maxHeight {
 			zap.L().Info("currentHeight >= maxHeight not handle currentHeight++ ", zap.Any("currentHeight++", currentHeight), zap.Any("maxHeight", maxHeight))
 			break
 		}

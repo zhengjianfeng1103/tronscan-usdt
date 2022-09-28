@@ -257,10 +257,8 @@ func (ts *TronScanner) Task() {
 
 		maxHeight := maxHeightBlock.GetBlockHeader().GetRawData().GetNumber()
 
-		currentHeight++
-
 		if currentHeight > maxHeight {
-			zap.L().Info("currentHeight >= maxHeight not handle currentHeight++ ", zap.Any("currentHeight++", currentHeight), zap.Any("maxHeight", maxHeight))
+			zap.L().Info("currentHeight > maxHeight not handle currentHeight++ ", zap.Any("currentHeight++", currentHeight), zap.Any("maxHeight", maxHeight))
 			break
 		}
 
@@ -364,6 +362,8 @@ func (ts *TronScanner) Task() {
 
 			zap.L().Debug("slowBlock", zap.Any("slowBlockHeight", slowBlock.GetBlockHeader().GetRawData().GetNumber()))
 		}
+
+		currentHeight++
 
 		zap.L().Info("producer status: ", zap.Any("blockPool", ts.BlockPools.Running()), zap.Any("txPool", ts.TxPools.Running()), zap.Any("Notify", ts.NotifyPools.Running()))
 	}
